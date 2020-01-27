@@ -51,12 +51,15 @@ def rename_desc(map, desc):
 
 def read_extra_params(old_root):
     old_ctrs = os.path.join(old_root, 'constructors.txt')
-    if not os.path.exists(old_ctrs): old_ctrs = os.path.join(old_root, 'extraParams.txt')
+    if not os.path.exists(old_ctrs): old_ctrs = os.path.join(old_root, 'params.txt')
+    warned = False
     if os.path.exists(old_ctrs):
         ctrs = {}
         with open(old_ctrs, 'r') as f:
             for line in f.readlines():
                 line = line.rstrip('\n')
+                if line.startswith('#'):
+                    continue
 
                 if len(line) == 0:
                     continue
@@ -64,10 +67,14 @@ def read_extra_params(old_root):
                 id,cls,desc,mname = None,None,None,None
                 linesplit = line.split(' ')
                 if len(linesplit) == 3:
-                    id,cls,desc = linesplit
-                    mname = '<init>'
+                     if not warned:
+                         warned = True
+                         print("Not reading param names - the old format used strange prefixes because ID uniqueness was not guaranteed. Script will now generate new IDs that don't overlap with existing ones!")
+                #    id,cls,desc = linesplit
+                #    mname = '<init>'
                 elif len(linesplit) == 4:
                     id,cls,mname,desc = linesplit
+                if id == None: continue
                 id = int(id)
 
                 fulldesc = '%s %s' % (mname, desc)
@@ -133,17 +140,18 @@ def migrate_mappings(mcp_root, old_version, new_version, output):
     rg_idx_max = find_max_rg(old_srg, old_root)
     new_classes = {}
     obf_whitelist = [] # Entries that do not need to follow SRG naming, so we don't 'unfix' them below.
+    params_whitelist = [] # Entries that do not get a method param id, i.e. because they override an external method like equals()
     meta = json.loads(open(os.path.join(output, '%s/joined_a_meta.json' % new_version), 'r').read())
     meta = {k:v for k,v in meta.items() if not 'minecraftforge' in k} #Remove Forge's annotations, I should filter this in MappingToy..
+    params = read_extra_params(old_root)
 
     err_f = open(os.path.join(migrate_root, 'migrate_errors.txt'), 'wb')
 
     add_new_classes(o_to_n, srg, new_classes, known_classes)
-    fix_enums(obf_whitelist, srg, meta)
+    fix_enums(obf_whitelist, params_whitelist, srg, meta)
     fix_method_names(obf_whitelist, srg, meta)
-    rg_idx_max = fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n)
-    old_params = read_extra_params(old_root)
-    rg_idx_max = fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_whitelist, old_params, os.path.join(new_root, 'extraParams.txt'))
+    rg_idx_max = fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, params_whitelist, params)
+    rg_idx_max = fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_whitelist, params_whitelist, params)
     fix_inner_class_shuffle(srg)
     rg_idx_max = create_new_entries(rg_idx_max, srg, o_to_n, meta, err_f)
     
@@ -161,6 +169,16 @@ def migrate_mappings(mcp_root, old_version, new_version, output):
                             
     from SRGSorter import dump_tsrg
     dump_tsrg(srg, os.path.join(new_root, 'joined.tsrg'))
+    new_params = os.path.join(new_root, 'params.txt')
+    data = {}
+    for cls,d in params.items():
+        for k,v in d.items():
+            if not v in data: data[v] = []
+            data[v].append('%s %s' % (cls, k))
+    with open(new_params, 'wb') as f:
+        for id in sorted(data.keys()):
+            for entry in data[id]:
+                f.write(('%s %s\n' % (id, entry)).encode())
     
 def find_max_rg(old_srg, old_root):
     #==========================================================================    
@@ -264,13 +282,14 @@ def add_new_classes(o_to_n, srg, new_classes, known_classes):
         if cls in known_classes:
             add_class(cls)
             
-def fix_enums(obf_whitelist, srg, meta):
+def fix_enums(obf_whitelist, ctrs_whitelist, srg, meta):
     #==========================================================================
     # Enums encode their field names as strings in the class, so we can force
     # their names to the real ones.
     # We also fix sythetic 'bouncer' methods. To make sure they have the same
     # name as the method they bounce to. As this is how the compiler deals with
     # generic overrides.
+    # We also make sure that value and valueOf dont get param names
     #==========================================================================
     print('Fixing Enum Names:')
     for cls,v in meta.items():
@@ -291,6 +310,13 @@ def fix_enums(obf_whitelist, srg, meta):
                         obf_whitelist.append(new)
                         print('  %s -> %s' % (key, force))
                         srg['FD:'][key] = new
+        if v['access'] & 0x4000 != 0: #is enum -- make sure values and valueOf does not get parameter names
+            mcls = srg['CL:'][cls]
+            valuesdesc = "values ()[L%s;" % mcls
+            valueOfdesc = "valueOf (Ljava/lang/String;)L%s;" % mcls
+            ctrs_whitelist.append((mcls, valuesdesc))
+            ctrs_whitelist.append((mcls, valueOfdesc))
+
     
 def fix_method_names(obf_whitelist, srg, meta):
     print('Fixing Method Names')
@@ -314,7 +340,7 @@ def fix_method_names(obf_whitelist, srg, meta):
                         print('  %s -> %s' % (key, force))
                         srg['MD:'][key] = new
 
-def fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_whitelist, ctrs, new_ctrs):
+def fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_whitelist, ctrs_whitelist, ctrs):
     #==========================================================================
     #  Use the unobfed names from the class/mappings if it matches Notch names
     #  Also attempts to detect things that 'lost' their unobfed names, and 
@@ -354,19 +380,19 @@ def fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_w
             desc = rename_desc(srg['CL:'], obf_desc)
             fulldesc = '%s %s' % (obf_name, desc)
             mcls = rename_class(srg['CL:'], obf_cls)
-            hasdesc = mcls in ctrs and fulldesc in ctrs[mcls]
+            hasdesc = (mcls,fulldesc) in ctrs_whitelist or (mcls in ctrs and fulldesc in ctrs[mcls])
             # skip methods that are known and constructors that lack params
             if obf_cls in new_classes or not (k in srg['MD:'] and hasdesc if obf_name != '<init>' else desc == "()V" or hasdesc):
                 filter = ['valueOf', 'values', 'main']
                 if not mcls in ctrs:
                     ctrs[mcls] = {}
-                if not fulldesc in ctrs[mcls]:
+                if not fulldesc in ctrs[mcls] and (mcls, fulldesc) not in ctrs_whitelist:
                     ctrs[mcls][fulldesc] = rg_idx_max
                     rg_idx_max += 1
                 if obf_name != '<init>': #constructors dont belong into the srg file for some reason
                     srg['MD:'][k] = '%s/%s %s' % (mcls, obf_name, desc)
                 if not obf_name in filter: #Just spam, it gets lost from RG's gen.. Figure a way to force these names to be in the list?
-                    print('  MD: NULL -> %s, param ID %d' % ('%s/%s %s' % (mcls, obf_name, desc), ctrs[mcls][fulldesc]))
+                    print('  MD: NULL -> %s, param ID %d' % ('%s/%s %s' % (mcls, obf_name, desc), ctrs[mcls][fulldesc] if fulldesc in ctrs[mcls] else -1))
         elif k in srg['MD:'] and not srg['MD:'][k] in obf_whitelist and not srg_name.startswith('func_') and not srg_name.startswith('access$'): # access$ method are synthetic bridges. Dont give them a srg name.
             new_name = 'func_%s_%s_' % (rg_idx_max, obf_name)
             rg_idx_max += 1
@@ -424,14 +450,6 @@ def fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_w
             print('  MD: %s -> %s' % (v, n))
             srg['MD:'][k] = n
 
-    data = {}
-    for cls,d in ctrs.items():
-        for k,v in d.items():
-            data[v] = '%s %s' % (cls, k)
-
-    with open(new_ctrs, 'wb') as f:
-        for id in sorted(data.keys()):
-            f.write(('%s %s\n' % (id, data[id])).encode())
     return rg_idx_max
 
 def fix_inner_class_shuffle(srg):
@@ -481,7 +499,7 @@ def fix_inner_class_shuffle(srg):
         for k,v in srg['MD:'].items():
             srg['MD:'][k] = '%s/%s %s' % (rename_class(renames, v.split(' ')[0].rsplit('/', 1)[0]), v.split(' ')[0].rsplit('/', 1)[1], rename_desc(renames, v.split(' ')[1]))
 
-def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n):
+def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, ctrs_whitelist, ctrs):
     print('Fixing overriden methods')
     linked = OrderedDict()
     roots = OrderedDict()
@@ -534,7 +552,16 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n):
                     error(err_f, 'Short: %s -> %s' % (child, id))
                     
                 ids.add(id)
-        
+            else:
+                obf_cls, obf_name, obf_desc = split_mtd(key)
+                nmd_cls = rename_class(srg['CL:'], obf_cls)
+                nmd_desc = rename_desc(srg['CL:'], obf_desc)
+                fulldesc = "%s %s" % (obf_name, nmd_desc)
+                if nmd_cls in ctrs and fulldesc in ctrs[nmd_cls]:
+                    id = ctrs[nmd_cls][fulldesc]
+                    ids.add(id)
+
+
         if key in o_to_n['MD:']:
             nname = o_to_n['MD:'][key].split(' ')[0].rsplit('/', 1)[1]
             if nname == name: #The root is unobfed
@@ -547,28 +574,41 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n):
                 if child in srg['MD:']:
                     error(err_f, '  %s -> %s' % (child, srg['MD:'][child].split(' ')[0].rsplit('/', 1)[1]))
                 else:
-                    error(err_f, '  %s -> NULL' % (child))
+                    obf_cls, obf_name, obf_desc = split_mtd(key)
+                    nmd_cls = rename_class(srg['CL:'], obf_cls)
+                    nmd_desc = rename_desc(srg['CL:'], obf_desc)
+                    fulldesc = "%s %s" % (obf_name, nmd_desc)
+                    if nmd_cls in ctrs and fulldesc in ctrs[nmd_cls]:
+                        error(err_f, '  %s -> Param ID %s' % (child, ctrs[nmd_cls][fulldesc]))
+                    else:
+                        error(err_f, '  %s -> NULL' % (child))
                     
         if not owner in meta: #Outside MC codebase, everything needs to use unobfed names
             for child in sorted(roots[key]):
                 cowner,cdesc = child.split(' ')
                 cowner,cname = cowner.rsplit('/', 1)
+                mcls, mdesc = (rename_class(srg['CL:'], cowner), rename_desc(srg['CL:'], cdesc))
+                fulldesc = "%s %s" % (name, mdesc)
                 if child in srg['MD:']:
                     oowner,odesc = srg['MD:'][child].split(' ')
                     oowner,oname = oowner.rsplit('/', 1)
                     
                     new = '%s/%s %s' % (oowner, name, odesc)
                     obf_whitelist.append(new)
+                    mcls = oowner
+                    fulldesc = "%s %s" % (name, odesc)
                     
                     if oname != name:
                         print('  %s %s -> %s' % (child, oname, name))
                         srg['MD:'][child] = new
                 else:
-                    new = '%s/%s %s' % (rename_class(srg['CL:'], cowner), name, rename_desc(srg['CL:'], cdesc))
+                    new = '%s/%s %s' % (mcls, name, mdesc)
                     obf_whitelist.append(new)
                     
                     print('  %s NULL -> %s' % (child, name))                    
                     srg['MD:'][child] = new
+                ctrs_whitelist.append((mcls, fulldesc))
+
         else:
             new_name = None
             if len(ids) == 1:
@@ -580,8 +620,9 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n):
                 new_name = 'func_%s_%s_' % (rg_idx_max, name)
                 rg_idx_max += 1
                 error(err_f, 'Failed to find ID: %s -> %s %s' % (key, new_name, sorted(ids)))
-            
-            if not new_name is None:
+
+            if not new_name is None: #can this even happen?
+                paramid = None
                 if key in srg['MD:']:
                     oowner,odesc = srg['MD:'][key].split(' ')
                     oowner,oname = oowner.rsplit('/', 1)
@@ -589,16 +630,37 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n):
                     new = '%s/%s %s' % (oowner, new_name, odesc)
                     if not obfed:
                         obf_whitelist.append(new)
+                        if not oowner in ctrs:
+                            ctrs[oowner] = {}
+                        fulldesc = "%s %s" % (new_name, odesc)
+                        if not fulldesc in ctrs[oowner]:
+                            paramid = rg_idx_max
+                            ctrs[oowner][fulldesc] = paramid
+                            rg_idx_max += 1
+                        else: paramid = ctrs[oowner][fulldesc]
                         
                     if oname != new_name:
-                        print('  %s %s -> %s' % (key, oname, new_name))
+                        if paramid == None:
+                            print('  %s %s -> %s' % (key, oname, new_name))
+                        else:
+                            print('  %s %s -> %s (param id %d)' % (key, oname, new_name, paramid))
                         srg['MD:'][key] = new
                 else:
-                    new = '%s/%s %s' % (rename_class(srg['CL:'], owner), new_name, rename_desc(srg['CL:'], desc))
+                    mcls, mdesc = (rename_class(srg['CL:'], owner), rename_desc(srg['CL:'], desc))
+                    new = '%s/%s %s' % (mcls, new_name, mdesc)
                     if not obfed:
                         obf_whitelist.append(new)
-                     
-                    print('  %s NULL -> %s' % (key, new_name))   
+                        if not mcls in ctrs:
+                            ctrs[mcls] = {}
+                        fulldesc = "%s %s" % (new_name, mdesc)
+                        if not fulldesc in ctrs[mcls]:
+                            paramid = rg_idx_max
+                            ctrs[mcls][fulldesc] = paramid
+                            rg_idx_max += 1
+                        else: paramid = ctrs[mcls][fulldesc]
+                        print('  %s NULL -> %s (param %d)' % (key, new_name, paramid))
+                    else:
+                        print('  %s NULL -> %s' % (key, new_name))
                     srg['MD:'][key] = new
                     
                 for child in sorted(roots[key]):
@@ -609,18 +671,34 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n):
                         oowner,oname = oowner.rsplit('/', 1)
                         
                         new = '%s/%s %s' % (oowner, new_name, odesc)
+
                         if not obfed:
                             obf_whitelist.append(new)
+                            if not oowner in ctrs:
+                                ctrs[oowner] = {}
+                            fulldesc = "%s %s" % (new_name, odesc)
+                            ctrs[oowner][fulldesc] = paramid
                             
                         if oname != new_name:
-                            print('  %s %s -> %s' % (child, oname, new_name))
+                            if paramid == None:
+                                print('  %s %s -> %s' % (child, oname, new_name))
+                            else:
+                                print('  %s %s -> %s (param id %d)' % (child, oname, new_name, paramid))
                             srg['MD:'][child] = new
                     else:
                         new = '%s/%s %s' % (rename_class(srg['CL:'], cowner), new_name, rename_desc(srg['CL:'], cdesc))
+                        cmcls, cmdesc = (rename_class(srg['CL:'], cowner), rename_desc(srg['CL:'], cdesc))
+                        new = '%s/%s %s' % (cmcls, new_name, cmdesc)
+
                         if not obfed:
                             obf_whitelist.append(new)
-                        
-                        print('  %s NULL -> %s' % (child, new_name))
+                            if not cmcls in ctrs:
+                                ctrs[cmcls] = {}
+                            fulldesc = "%s %s" % (new_name, cmdesc)
+                            ctrs[cmcls][fulldesc] = paramid
+                            print('  %s NULL -> %s (param %d)' % (child, new_name, paramid))
+                        else:
+                            print('  %s NULL -> %s' % (child, new_name))
                         srg['MD:'][child] = new
                     
     return rg_idx_max
