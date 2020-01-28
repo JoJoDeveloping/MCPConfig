@@ -584,6 +584,12 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, ct
                         error(err_f, '  %s -> NULL' % (child))
                     
         if not owner in meta: #Outside MC codebase, everything needs to use unobfed names
+            if not owner in ctrs:
+                ctrs[owner] = {}
+            pfulldesc = "%s %s" % (name, desc)
+            if not pfulldesc in ctrs[owner]:
+                ctrs[owner][pfulldesc] = rg_idx_max
+                rg_idx_max += 1
             for child in sorted(roots[key]):
                 cowner,cdesc = child.split(' ')
                 cowner,cname = cowner.rsplit('/', 1)
@@ -674,16 +680,14 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, ct
 
                         if not obfed:
                             obf_whitelist.append(new)
-                            if not oowner in ctrs:
-                                ctrs[oowner] = {}
                             fulldesc = "%s %s" % (new_name, odesc)
-                            ctrs[oowner][fulldesc] = paramid
+                            ctrs_whitelist.append((oowner, fulldesc))
                             
                         if oname != new_name:
                             if paramid == None:
                                 print('  %s %s -> %s' % (child, oname, new_name))
                             else:
-                                print('  %s %s -> %s (param id %d)' % (child, oname, new_name, paramid))
+                                print('  %s %s -> %s (inherited param id %d)' % (child, oname, new_name, paramid))
                             srg['MD:'][child] = new
                     else:
                         new = '%s/%s %s' % (rename_class(srg['CL:'], cowner), new_name, rename_desc(srg['CL:'], cdesc))
@@ -692,11 +696,9 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, ct
 
                         if not obfed:
                             obf_whitelist.append(new)
-                            if not cmcls in ctrs:
-                                ctrs[cmcls] = {}
                             fulldesc = "%s %s" % (new_name, cmdesc)
-                            ctrs[cmcls][fulldesc] = paramid
-                            print('  %s NULL -> %s (param %d)' % (child, new_name, paramid))
+                            ctrs_whitelist.append((cmcls, fulldesc))
+                            print('  %s NULL -> %s (inherited param id %d)' % (child, new_name, paramid))
                         else:
                             print('  %s NULL -> %s' % (child, new_name))
                         srg['MD:'][child] = new
