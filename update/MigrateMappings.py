@@ -49,7 +49,7 @@ def rename_class(map, cls):
 def rename_desc(map, desc):
     return reg_desc.sub(lambda match: 'L%s;' % rename_class(map, match.group(1)), desc)
 
-def read_extra_params(old_root):
+def read_extra_params(old_root, old_srg, map):
     old_ctrs = os.path.join(old_root, 'constructors.txt')
     if not os.path.exists(old_ctrs): old_ctrs = os.path.join(old_root, 'params.txt')
     warned = False
@@ -83,7 +83,35 @@ def read_extra_params(old_root):
                 if fulldesc in ctrs[cls]:
                     print('  Duplicate extra param: %s %s %s %s -> %s' % (cls, mname, desc, ctrs[cls][fulldesc], id))
                 ctrs[cls][fulldesc] = id
-    return ctrs
+
+    old_srg_inverse = {}
+    for type in ['CL:', 'FD:', 'MD:']:
+        old_srg_inverse[type] = {}
+        for ocn in old_srg[type]:
+            old_srg_inverse[type][old_srg[type][ocn]] = ocn
+    params = {}
+    for cls in ctrs:
+        new_cls = cls
+        if cls in old_srg_inverse['CL:'] and old_srg_inverse['CL:'][cls] in map:
+            new_obf_name = map[old_srg_inverse['CL:'][cls]]
+            new_cls = srg['CL:'][new_obf_name]
+
+        if cls.startswith('net/minecraft/') or cls.startswith('com/mojang/') and not (cls in new_classes or cls in known_classes):
+            print("Class %s doesn't exist anymore, removing from params!" % cls)
+        params[new_cls] = {}
+        for fulldesc in ctrs[cls]:
+            (name,desc) = fulldesc.split(' ')
+            old_obf_desc = rename_desc(old_srg_inverse['CL:'], desc)
+            old_obf_fulldesc = "%s %s" % (name, old_obf_desc)
+            if old_obf_fulldesc in map:
+                (new_name, new_obf_desc) = map[old_obf_fulldesc].split(' ')
+                new_desc = rename_desc(srg['CL:'], new_obf_desc)
+                new_fulldesc = "%s %s" % (new_name, new_desc)
+                params[new_cls][new_fulldesc] = ctrs[cls][fulldesc]
+                if new_cls != cls or new_fulldesc != fulldesc:
+                    print("Migrated param id %d from %s %s to %s %s" %(ctrs[cls][fulldesc], cls, fulldesc, new_cls, new_fulldesc))
+    return params
+
 
 reg_desc = re.compile('L([^;]+);')
 new_class_index = 1000
@@ -143,13 +171,17 @@ def migrate_mappings(mcp_root, old_version, new_version, output):
     params_whitelist = [] # Entries that do not get a method param id, i.e. because they override an external method like equals()
     meta = json.loads(open(os.path.join(output, '%s/joined_a_meta.json' % new_version), 'r').read())
     meta = {k:v for k,v in meta.items() if not 'minecraftforge' in k} #Remove Forge's annotations, I should filter this in MappingToy..
-    params = read_extra_params(old_root)
 
     err_f = open(os.path.join(migrate_root, 'migrate_errors.txt'), 'wb')
 
     add_new_classes(o_to_n, srg, new_classes, known_classes)
+
+    params = read_extra_params(old_root, old_srg, map)
+
+
+
     fix_enums(obf_whitelist, params_whitelist, srg, meta)
-    fix_method_names(obf_whitelist, srg, meta)
+    fix_method_names(obf_whitelist, srg, meta, params)
     rg_idx_max = fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, params_whitelist, params)
     rg_idx_max = fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_whitelist, params_whitelist, params)
     fix_inner_class_shuffle(srg)
@@ -197,7 +229,7 @@ def find_max_rg(old_srg, old_root):
     for k,v in old_srg['MD:'].items():
         rg_idx_max = max_rg(rg_idx_max, v.split(' ')[0].rsplit('/', 1)[1])
         
-    old_ctrs = os.path.join(old_root, 'constructors.txt')
+    old_ctrs = os.path.join(old_root, 'params.txt')
     if os.path.exists(old_ctrs):
         with open(old_ctrs, 'r') as f:
             for line in f.readlines():
@@ -318,7 +350,7 @@ def fix_enums(obf_whitelist, ctrs_whitelist, srg, meta):
             ctrs_whitelist.append((mcls, valueOfdesc))
 
     
-def fix_method_names(obf_whitelist, srg, meta):
+def fix_method_names(obf_whitelist, srg, meta, params):
     print('Fixing Method Names')
     for cls,v in meta.items():
         if 'methods' in v:
@@ -334,6 +366,22 @@ def fix_method_names(obf_whitelist, srg, meta):
                         if not old == new:
                             srg['MD:'][key] = new
                             print('  %s -> %s' % (old.split(' ')[0], force))
+                            name = old.split(' ')[0].rsplit('/', 1)[1]
+                        if old.startswith("func_"):
+                            srgid = int(old.split('_')[1])
+                            fulldesc = "%s %s" % (old.split(' ')[0].rsplit('/', 1)[1], rename_desc(srg['CL:'], desc))
+                            if srg['CL:'][cls] not in params: params[srg['CL:'][cls]] = {}
+                            params[srg['CL:'][cls]][fulldesc] = srgid
+                            print("Reusing srg id %d as paramid for %s %s from old %s " % (srgid, srg['CL:'][cls], fulldesc, key))
+                        else:
+                            fulldesc_old = "%s %s" % (old.split(' ')[0].rsplit('/', 1)[1], rename_desc(srg['CL:'], desc))
+                            fulldesc_new = "%s %s" % (force, rename_desc(srg['CL:'], desc))
+                            if srg['CL:'][cls] not in params: params[srg['CL:'][cls]] = {}
+                            if fulldesc_old in params[srg['CL:'][cls]]:
+                                srgid = params[srg['CL:'][cls]][fulldesc_old]
+                                del(params[srg['CL:'][cls]][fulldesc_old])
+                                params[srg['CL:'][cls]][fulldesc_new] = srgid
+                                print("Reusing srg id %d as paramid for %s %s from old %s " % (srgid, srg['CL:'][cls], fulldesc, fuldesc_old))
                     else:
                         new = '%s/%s %s' % (srg['CL:'][key.split(' ')[0].rsplit('/', 1)[0]], force, rename_desc(srg['CL:'], desc))
                         obf_whitelist.append(new)
@@ -381,6 +429,7 @@ def fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_w
             fulldesc = '%s %s' % (obf_name, desc)
             mcls = rename_class(srg['CL:'], obf_cls)
             hasdesc = (mcls,fulldesc) in ctrs_whitelist or (mcls in ctrs and fulldesc in ctrs[mcls])
+            old_print_behavior = (obf_cls in new_classes or not k in srg['MD:']) and not obf_name.startswith('<')
             # skip methods that are known and constructors that lack params
             if obf_cls in new_classes or not (k in srg['MD:'] and hasdesc if obf_name != '<init>' else desc == "()V" or hasdesc):
                 filter = ['valueOf', 'values', 'main']
@@ -391,11 +440,20 @@ def fix_unobfed_names(rg_idx_max, known_classes, new_classes, srg, o_to_n, obf_w
                     rg_idx_max += 1
                 if obf_name != '<init>': #constructors dont belong into the srg file for some reason
                     srg['MD:'][k] = '%s/%s %s' % (mcls, obf_name, desc)
-                if not obf_name in filter: #Just spam, it gets lost from RG's gen.. Figure a way to force these names to be in the list?
-                    print('  MD: NULL -> %s, param ID %d' % ('%s/%s %s' % (mcls, obf_name, desc), ctrs[mcls][fulldesc] if fulldesc in ctrs[mcls] else -1))
+                #remove `and old_print_behavior` once a run has been completed
+                if not obf_name in filter and old_print_behavior: #Just spam, it gets lost from RG's gen.. Figure a way to force these names to be in the list?
+                    print('  MD: NULL -> %s, param ID %s' % ('%s/%s %s' % (mcls, obf_name, desc), str(ctrs[mcls][fulldesc]) if fulldesc in ctrs[mcls] else "inherited"))
         elif k in srg['MD:'] and not srg['MD:'][k] in obf_whitelist and not srg_name.startswith('func_') and not srg_name.startswith('access$'): # access$ method are synthetic bridges. Dont give them a srg name.
-            new_name = 'func_%s_%s_' % (rg_idx_max, obf_name)
-            rg_idx_max += 1
+            srgid = rg_idx_max
+            desc = rename_desc(srg['CL:'], obf_desc)
+            fulldesc = '%s %s' % (obf_name, desc)
+            mcls = rename_class(srg['CL:'], obf_cls)
+            if mcls in ctrs and fulldesc in ctrs[mcls]:
+                srgid = ctrs[mcls][fulldesc]
+                del(ctrs[mcls][fulldesc])
+                print("Using paramid %d as srg id for %s %s %s" % (srgid, mcls, obf_name, desc))
+            new_name = 'func_%s_%s_' % (srgid, obf_name)
+            if srgid == rg_idx_max: rg_idx_max += 1
             print('  MD: %s -> %s' % (srg['MD:'][k], new_name))
             srg['MD:'][k] = '%s/%s %s' % (rename_class(srg['CL:'], obf_cls), new_name, srg_desc)
         elif obf_name.startswith('lambda$'): #Unobfed lambdas, they are sythetic, so we care to add srg names to rename params?
@@ -605,13 +663,13 @@ def fix_override_methods(rg_idx_max, meta, srg, err_f, obf_whitelist, o_to_n, ct
                     fulldesc = "%s %s" % (name, odesc)
                     
                     if oname != name:
-                        print('  %s %s -> %s' % (child, oname, name))
+                        print('  %s %s -> %s (inherited param id %d)' % (child, oname, name, ctrs[owner][pfulldesc]))
                         srg['MD:'][child] = new
                 else:
                     new = '%s/%s %s' % (mcls, name, mdesc)
                     obf_whitelist.append(new)
                     
-                    print('  %s NULL -> %s' % (child, name))                    
+                    print('  %s NULL -> %s (inherited param id %d)' % (child, name, ctrs[owner][pfulldesc]))
                     srg['MD:'][child] = new
                 ctrs_whitelist.append((mcls, fulldesc))
 
